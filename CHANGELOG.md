@@ -1,3 +1,7 @@
+## Unreleased
+
+- Added `--version` flag (bench-wide CLI convention: `<tool> <VERSION>`; module-level `VERSION` constant as single source of truth).
+
 # memport changelog
 
 ## v1 — 2026-10-21

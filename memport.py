@@ -458,6 +458,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="memport",
         description="Portable agent memory export/import (see FORMAT.md).")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     ex = sub.add_parser("export", help="export a memory directory to .memport")
