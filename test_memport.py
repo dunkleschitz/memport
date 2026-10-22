@@ -365,5 +365,188 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+class TestCollect(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "root")
+        os.makedirs(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def do_collect(self, platform, files, root=None):
+        root = root or self.root
+        make_tree(root, files)
+        out = os.path.join(self.tmp.name, "out")
+        a = Args(platform=platform, root=root, out=out)
+        self.assertEqual(memport.cmd_collect(a), 0)
+        return read_tree(out)
+
+    def test_claude_code_collects_memory_not_transcripts(self):
+        got = self.do_collect("claude-code", {
+            "CLAUDE.md": "# project\n",
+            "CLAUDE.local.md": "# personal\n",
+            ".claude/rules/api.md": "# api rules\n",
+            ".claude/projects/proj/session.jsonl": '{"x":1}\n',  # decoy
+            ".claude/settings.json": "{}\n",                    # decoy
+            "notes.txt": "random\n",                            # decoy
+        })
+        self.assertIn("claude-code/CLAUDE.md", got)
+        self.assertIn("claude-code/CLAUDE.local.md", got)
+        self.assertIn("claude-code/.claude/rules/api.md", got)
+        self.assertIn("SOURCE.txt", got)
+        for rel in got:
+            self.assertNotIn("session.jsonl", rel)
+            self.assertNotIn("settings.json", rel)
+            self.assertNotIn("notes.txt", rel)
+
+    def test_claude_code_home_root(self):
+        home = os.path.join(self.tmp.name, "home", ".claude")
+        got = self.do_collect("claude-code", {
+            "CLAUDE.md": "# user prefs\n",
+            "rules/personal.md": "# personal rules\n",
+        }, root=home)
+        self.assertIn("claude-code/CLAUDE.md", got)
+        self.assertIn("claude-code/rules/personal.md", got)
+
+    def test_cursor_collects_mdc_not_md(self):
+        got = self.do_collect("cursor", {
+            ".cursor/rules/api.mdc": "---\nalwaysApply: true\n---\n",
+            ".cursor/rules/draft.md": "ignored by Cursor\n",  # decoy
+            ".cursorrules": "legacy\n",
+            "AGENTS.md": "# agents\n",
+            ".cursor/settings.json": "{}\n",                  # decoy
+        })
+        self.assertIn("cursor/.cursor/rules/api.mdc", got)
+        self.assertIn("cursor/.cursorrules", got)
+        self.assertIn("cursor/AGENTS.md", got)
+        self.assertNotIn("cursor/.cursor/rules/draft.md", got)
+        self.assertNotIn("cursor/.cursor/settings.json", got)
+
+    def test_opencode_collects_markdown_only(self):
+        got = self.do_collect("opencode", {
+            "AGENTS.md": "# agents\n",
+            "sub/AGENTS.md": "# nested\n",
+            ".opencode/project.md": "# project memory\n",
+            ".opencode/agent/review.md": "# review\n",
+            ".opencode/opencode.json": "{}\n",  # decoy: config, not memory
+        })
+        self.assertIn("opencode/AGENTS.md", got)
+        self.assertIn("opencode/sub/AGENTS.md", got)
+        self.assertIn("opencode/.opencode/project.md", got)
+        self.assertIn("opencode/.opencode/agent/review.md", got)
+        self.assertNotIn("opencode/.opencode/opencode.json", got)
+
+    def test_codex_collects_agents_files(self):
+        got = self.do_collect("codex", {
+            "AGENTS.md": "# agents\n",
+            "AGENTS.override.md": "# override\n",
+            "src/main.py": "print(1)\n",  # decoy
+        })
+        self.assertIn("codex/AGENTS.md", got)
+        self.assertIn("codex/AGENTS.override.md", got)
+        self.assertNotIn("codex/src/main.py", got)
+
+    def test_gemini_collects_gemini_md(self):
+        got = self.do_collect("gemini", {
+            "GEMINI.md": "# project\n",
+            ".gemini/GEMINI.md": "# config dir\n",
+            ".gemini/chats/x.json": "{}\n",  # decoy: saved session
+        })
+        self.assertIn("gemini/GEMINI.md", got)
+        self.assertIn("gemini/.gemini/GEMINI.md", got)
+        self.assertNotIn("gemini/.gemini/chats/x.json", got)
+
+    def test_generic_collects_memory_tree(self):
+        got = self.do_collect("generic", {
+            "MEMORY.md": "# memory\n",
+            "memory/2026-10-22.md": "notes\n",
+            "memory/people/friend.md": "bio\n",
+            "AGENTS.md": "# agents\n",
+        })
+        self.assertIn("generic/MEMORY.md", got)
+        self.assertIn("generic/memory/2026-10-22.md", got)
+        self.assertIn("generic/memory/people/friend.md", got)
+
+    def test_source_txt_records_provenance(self):
+        got = self.do_collect("generic", {"MEMORY.md": "x\n"})
+        src = got["SOURCE.txt"].decode("utf-8")
+        self.assertIn("platform: generic", src)
+        self.assertIn("root: ", src)
+        self.assertIn("collector: memport ", src)
+        self.assertIn("files: 1", src)
+
+    def test_symlink_not_collected(self):
+        make_tree(self.root, {"MEMORY.md": "x\n"})
+        os.symlink(os.path.join(self.root, "MEMORY.md"),
+                   os.path.join(self.root, "LINK.md"))
+        out = os.path.join(self.tmp.name, "out")
+        a = Args(platform="generic", root=self.root, out=out)
+        self.assertEqual(memport.cmd_collect(a), 0)
+        got = read_tree(out)
+        self.assertNotIn("generic/LINK.md", got)
+
+    def test_collect_unknown_platform_exit_two(self):
+        a = Args(platform="nope", root=self.root,
+                 out=os.path.join(self.tmp.name, "out"))
+        self.assertEqual(memport.cmd_collect(a), 2)
+
+    def test_collect_missing_root_exit_two(self):
+        a = Args(platform="generic", root=os.path.join(self.tmp.name, "nope"),
+                 out=os.path.join(self.tmp.name, "out"))
+        self.assertEqual(memport.cmd_collect(a), 2)
+
+    def test_collect_refuses_nonempty_out(self):
+        out = os.path.join(self.tmp.name, "out")
+        os.makedirs(out)
+        make_tree(out, {"junk.txt": "x"})
+        a = Args(platform="generic", root=self.root, out=out)
+        self.assertEqual(memport.cmd_collect(a), 1)
+
+    def test_export_from_end_to_end(self):
+        make_tree(self.root, {
+            "CLAUDE.md": "# project\n",
+            ".claude/projects/x/session.jsonl": "{}\n",  # decoy
+        })
+        arc = os.path.join(self.tmp.name, "snap.memport")
+        a = Args(source=None, from_platform="claude-code", plat_root=self.root,
+                 out=arc, name=None, exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 0)
+        header, entries, blobs = memport.read_archive(arc)
+        self.assertEqual(header.get("source-platform"), "claude-code")
+        self.assertEqual(header.get("source-root"),
+                         os.path.abspath(self.root))
+        rels = [rel for rel, _d, _s in entries]
+        self.assertIn("claude-code/CLAUDE.md", rels)
+        self.assertIn("SOURCE.txt", rels)
+        self.assertEqual(len(rels), 2)
+        # Import roundtrip preserves the collected tree.
+        dst = os.path.join(self.tmp.name, "dst")
+        a2 = Args(file=arc, target=dst, layout="preserve")
+        self.assertEqual(memport.cmd_import(a2), 0)
+        got = read_tree(dst)
+        self.assertEqual(got["claude-code/CLAUDE.md"], b"# project\n")
+
+    def test_export_from_no_matches_exit_two(self):
+        make_tree(self.root, {"random.txt": "x\n"})
+        arc = os.path.join(self.tmp.name, "snap.memport")
+        a = Args(source=None, from_platform="codex", plat_root=self.root,
+                 out=arc, name=None, exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 2)
+
+    def test_export_source_and_from_conflict_exit_two(self):
+        arc = os.path.join(self.tmp.name, "snap.memport")
+        a = Args(source=self.root, from_platform="codex",
+                 plat_root=self.root, out=arc, name=None,
+                 exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 2)
+
+    def test_export_neither_source_nor_from_exit_two(self):
+        arc = os.path.join(self.tmp.name, "snap.memport")
+        a = Args(source=None, from_platform=None, plat_root=None,
+                 out=arc, name=None, exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

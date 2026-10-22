@@ -1,6 +1,20 @@
 ## Unreleased
 
 - Added `--version` flag (bench-wide CLI convention: `<tool> <VERSION>`; module-level `VERSION` constant as single source of truth).
+- **v0.4.0: platform adapters.** New `collect --platform P --root DIR --out DIR`
+  subcommand and `export --from P --root DIR` sugar: normalize the native
+  memory layouts of `claude-code`, `cursor`, `opencode`, `codex`, `gemini`
+  (plus `generic` for plain markdown trees) into `<platform>/…` +
+  `SOURCE.txt` provenance, then export through the normal pipeline.
+  Adapters collect instruction/memory markdown only — transcripts, logs,
+  configs, and credentials are deliberately excluded (documented per
+  adapter in `ADAPTERS` and in `SOURCE.txt`). Manifest gains
+  `source-platform` / `source-root` header keys (FORMAT.md updated).
+  16 new tests (per-platform fixtures incl. decoys, symlink refusal,
+  usage errors, export/import roundtrip); suite now 45/45. Two real bugs
+  caught by the new tests: `memory/**/*.md`-style globs miss one level
+  deep (added explicit single-level globs), and `export --from` on zero
+  matches archived a lone SOURCE.txt (now exits 2).
 
 # memport changelog
 

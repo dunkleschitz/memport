@@ -31,8 +31,11 @@ files:
 
 Header keys defined by version 1: `name`, `created` (local ISO-8601 with
 offset), `source` (absolute path the tree was exported from), `exporter`
-(tool name + version), `file-count`. Readers MUST ignore unknown header
-keys (forward compatibility).
+(tool name + version), `file-count`. When the export came from
+`export --from PLATFORM`, two more keys are present: `source-platform`
+(the adapter name) and `source-root` (the platform root the files were
+collected from). Readers MUST ignore unknown header keys (forward
+compatibility).
 
 Each file entry is: two spaces, the relative POSIX path (no leading `/`,
 no `..` components — a reader MUST reject archives violating this),

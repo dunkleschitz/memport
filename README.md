@@ -14,6 +14,14 @@ Single file, stdlib only: `memport.py`.
 # Export this agent's memory tree
 python3 memport.py export --source ~/memory --out backup-2026-10-21.memport
 
+# Collect another platform's native memory layout, then export it
+python3 memport.py export --from claude-code --root ~/projects/myapp \
+    --out myapp-context.memport
+
+# Or collect first (inspectable tree + SOURCE.txt provenance), export later
+python3 memport.py collect --platform cursor --root ~/projects/myapp --out ctx-tree
+python3 memport.py export --source ctx-tree --out ctx-tree.memport
+
 # See what's inside, and verify checksums
 python3 memport.py inspect backup-2026-10-21.memport --verify
 
@@ -27,6 +35,37 @@ python3 memport.py diff backup-2026-10-20.memport backup-2026-10-21.memport
 python3 memport.py merge base.memport other.memport --into ./merged \
     --strategy keep-base   # or keep-other | both | report (dry run)
 ```
+
+## Platform adapters (`collect`, `export --from`)
+
+`export --source` packs any directory you point it at. `collect` and
+`export --from` go one step further: they know where each major agent
+platform keeps its memory and instruction files, gather them into a
+normalized tree (`<platform>/…` plus a `SOURCE.txt` provenance record),
+and hand that tree to the normal export pipeline. Point `--root` at a
+project root for project-scoped files, or at the platform's home
+directory (e.g. `~/.claude`) for user-scoped files.
+
+| Platform | `--root` examples | What gets collected |
+|---|---|---|
+| `claude-code` | project root · `~/.claude` · `~/.claude/projects/<slug>` | `CLAUDE.md` (+ nested), `CLAUDE.local.md`, `.claude/rules/*.md`, personal `rules/*.md`, auto-memory `memory/*.md` |
+| `cursor` | project root | `.cursor/rules/*.mdc`, `.cursorrules`, `AGENTS.md` |
+| `opencode` | project root | `AGENTS.md` (+ nested), `.opencode/**/*.md` |
+| `codex` | project root | `AGENTS.md` (+ nested), `AGENTS.override.md` |
+| `gemini` | project root · `~/.gemini` | `GEMINI.md` (+ nested), `.gemini/GEMINI.md` |
+| `generic` | any markdown memory tree | `MEMORY.md` (+ nested), `memory/**/*.md`, `AGENTS.md` |
+
+Deliberately **never** collected: session transcripts, chat logs, prompt
+history, `settings.json`/TOML configs, MCP configs, and anything
+credential-shaped (`auth.json`, tokens). Each adapter documents its exact
+exclusions in `memport.py` (`ADAPTERS`) and in the tree's `SOURCE.txt`.
+Transcripts are session-scoped and often huge; configs hold secrets and
+machine-specific settings — neither is portable memory.
+
+Caveat: adapters track each platform's *documented* layout as of Oct
+2026. Platforms move files around; if `collect` finds nothing it says so
+(stderr warning, `export --from` exits 2). Check `SOURCE.txt`'s `globs:`
+line to see exactly what was looked for.
 
 ## Options
 
@@ -63,9 +102,13 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 
 ## Limitations
 
-- **Format is memport-native.** The receiving side needs memport (or an
-  independent reader of the documented FORMAT.md) to unpack; there is no
-  importer for any platform's proprietary memory store.
+- **Format is memport-native, but collection is cross-platform.** `collect`
+  / `export --from` normalize Claude Code, Cursor, OpenCode, Codex, and
+  Gemini layouts into one tree, so the archive *content* is portable.
+  Unpacking still needs memport (or an independent reader of the
+  documented FORMAT.md) — there is no writer for any platform's
+  proprietary memory store, and `import` restores files as-is rather
+  than translating them into the target platform's layout.
 - **Redaction is blunt.** `--redact` matches whole lines against a regex;
   it is not a semantic scrubber, and non-UTF-8 files are never redacted
   (they pass through untouched). Always `inspect` before sharing.

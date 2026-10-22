@@ -11,11 +11,19 @@ Stdlib only. Read FORMAT.md for the archive format specification.
 Usage:
     memport.py export  --source DIR --out FILE.memport [--name NAME]
                        [--exclude GLOB ...] [--redact REGEX ...]
+    memport.py export  --from PLATFORM --root DIR --out FILE.memport
+                       (collect a platform's native layout, then export it)
+    memport.py collect --platform PLATFORM --root DIR --out DIR
     memport.py inspect FILE.memport [--verify]
     memport.py import  FILE.memport --target DIR [--layout preserve|flat]
     memport.py diff   OLD.memport NEW.memport [--verify]
     memport.py merge  BASE.mport OTHER.mport --into DIR
                       [--strategy keep-base|keep-other|both|report]
+
+Platforms for collect / export --from: claude-code, cursor, opencode,
+codex, gemini, generic. --root is the platform's root directory: a
+project root for project-scoped files, or the platform's home directory
+(e.g. ~/.claude) for user-scoped files.
 """
 
 import argparse
@@ -27,13 +35,80 @@ import re
 import shutil
 import sys
 import tarfile
+import tempfile
 import time
 
 MAGIC = "MEMPORT/1"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MANIFEST_NAME = "MANIFEST.txt"
 FILES_PREFIX = "files/"
 REDACT_TOKEN = "[REDACTED]"
+
+# Platform-native memory layouts, verified against each platform's
+# documented file locations (Oct 2026). Globs are matched root-relative
+# against --root with fnmatch (so '*' crosses directories). Each adapter
+# collects instruction/memory markdown only — never transcripts, logs,
+# settings, or credentials. The "excludes" note documents what was
+# deliberately left out and why.
+ADAPTERS = {
+    "claude-code": {
+        "description": "Claude Code instruction and memory files",
+        "globs": [
+            "CLAUDE.md", "**/CLAUDE.md",      # project memory (also nested)
+            "CLAUDE.local.md",                # personal project memory
+            ".claude/CLAUDE.md",              # alt project location
+            ".claude/rules/*.md",             # project rules
+            "rules/*.md",                     # --root=~/.claude: personal rules
+            "memory/*.md",                    # --root=~/.claude/projects/<slug>: auto memory
+        ],
+        "excludes": ("session transcripts (projects/*/*.jsonl), history.jsonl, "
+                     "settings.json, auth tokens — never collected"),
+    },
+    "cursor": {
+        "description": "Cursor project rules and instruction files",
+        "globs": [
+            ".cursor/rules/*.mdc",            # project rules (plain .md ignored by Cursor)
+            ".cursorrules",                   # legacy single-file rules
+            "AGENTS.md", "**/AGENTS.md",      # Cursor reads AGENTS.md
+        ],
+        "excludes": ("global user rules (location varies by Cursor version; "
+                     "not collected), MCP configs, anything outside the root"),
+    },
+    "opencode": {
+        "description": "OpenCode instruction files and markdown config",
+        "globs": [
+            "AGENTS.md", "**/AGENTS.md",      # project rules (also CLAUDE.md fallback source)
+            ".opencode/*.md", ".opencode/**/*.md",  # project agents/commands/memory markdown
+        ],
+        "excludes": "opencode.json and other non-markdown config — memory markdown only",
+    },
+    "codex": {
+        "description": "Codex CLI instruction files",
+        "globs": [
+            "AGENTS.md", "**/AGENTS.md",
+            "AGENTS.override.md",             # temporary context override
+        ],
+        "excludes": ("~/.codex/auth.json (credentials), sessions/, log/, "
+                     "history.jsonl — never collected"),
+    },
+    "gemini": {
+        "description": "Gemini CLI memory files",
+        "globs": [
+            "GEMINI.md", "**/GEMINI.md",      # project memory (root + subdirs)
+            ".gemini/GEMINI.md",              # project config-dir memory
+        ],
+        "excludes": "chats/ (saved sessions), settings.json, credentials — never collected",
+    },
+    "generic": {
+        "description": "Plain markdown memory trees (MEMORY.md + dated notes)",
+        "globs": [
+            "MEMORY.md", "**/MEMORY.md",
+            "memory/*.md", "memory/**/*.md",  # dated notes, people/groups pages
+            "AGENTS.md",
+        ],
+        "excludes": "nothing by pattern — markdown only by glob design",
+    },
+}
 
 
 def utc_iso_now():
@@ -96,12 +171,15 @@ def apply_redactions(data, regexes):
     return "".join(out_lines).encode("utf-8"), count
 
 
-def build_manifest(name, source, entries):
+def build_manifest(name, source, entries, platform=None, platform_root=None):
     """entries: list of (relpath, sha256, size). Returns manifest text."""
     lines = [MAGIC]
     lines.append("name: %s" % name)
     lines.append("created: %s" % utc_iso_now())
     lines.append("source: %s" % os.path.abspath(source))
+    if platform:
+        lines.append("source-platform: %s" % platform)
+        lines.append("source-root: %s" % platform_root)
     lines.append("exporter: memport %s" % VERSION)
     lines.append("file-count: %d" % len(entries))
     lines.append("files:")
@@ -143,15 +221,128 @@ def parse_manifest(text):
     return header, entries
 
 
+def collect_tree(platform, root, out):
+    """Copy the adapter's matched files from root into out/<platform>/,
+    preserving relative paths. Symlinks are never followed (iter_files
+    already skips them). Returns the number of files collected.
+    Raises ValueError on unknown platform."""
+    if platform not in ADAPTERS:
+        raise ValueError("unknown platform: %r (choose from: %s)"
+                         % (platform, ", ".join(sorted(ADAPTERS))))
+    globs = ADAPTERS[platform]["globs"]
+    dest_base = os.path.join(out, platform)
+    count = 0
+    for rel, full in iter_files(root):
+        if not any(fnmatch.fnmatch(rel, g) for g in globs):
+            continue
+        dest = safe_join(dest_base, rel)
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(full, "rb") as f:
+            data = f.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        count += 1
+    return count
+
+
+def write_source_record(out, platform, root, count):
+    """Write SOURCE.txt provenance record at the top of a collect tree."""
+    record = [
+        "memport-collect/1",
+        "platform: %s" % platform,
+        "root: %s" % os.path.abspath(root),
+        "collected: %s" % utc_iso_now(),
+        "collector: memport %s" % VERSION,
+        "files: %d" % count,
+        "globs: %s" % ", ".join(ADAPTERS[platform]["globs"]),
+        "excludes: %s" % ADAPTERS[platform]["excludes"],
+    ]
+    with open(os.path.join(out, "SOURCE.txt"), "w") as f:
+        f.write("\n".join(record) + "\n")
+
+
+def cmd_collect(args):
+    platform = args.platform
+    if platform not in ADAPTERS:
+        print("error: unknown platform: %s (choose from: %s)"
+              % (platform, ", ".join(sorted(ADAPTERS))), file=sys.stderr)
+        return 2
+    root = args.root
+    if not os.path.isdir(root):
+        print("error: root is not a directory: %s" % root, file=sys.stderr)
+        return 2
+    out = args.out
+    if os.path.exists(out):
+        if not os.path.isdir(out) or os.listdir(out):
+            print("error: refusing to collect into non-empty target: %s"
+                  % out, file=sys.stderr)
+            return 1
+    else:
+        os.makedirs(out, exist_ok=True)
+    count = collect_tree(platform, root, out)
+    write_source_record(out, platform, root, count)
+    print("collected %d file(s) for platform '%s' from %s -> %s"
+          % (count, platform, root, out))
+    if count == 0:
+        print("warning: no %s memory files found under %s"
+              % (platform, root), file=sys.stderr)
+    return 0
+
+
 def cmd_export(args):
+    from_platform = getattr(args, "from_platform", None)
     source = args.source
-    if not os.path.isdir(source):
-        print("error: source is not a directory: %s" % source, file=sys.stderr)
+    if from_platform and source:
+        print("error: --source and --from are mutually exclusive",
+              file=sys.stderr)
         return 2
-    entries = apply_excludes(iter_files(source), args.exclude)
-    if not entries:
-        print("error: nothing to export (no files after excludes)", file=sys.stderr)
+    if not from_platform and not source:
+        print("error: need --source DIR or --from PLATFORM", file=sys.stderr)
         return 2
+    platform_info = (None, None)
+    tmp_collect = None
+    try:
+        if from_platform:
+            if from_platform not in ADAPTERS:
+                print("error: unknown platform: %s (choose from: %s)"
+                      % (from_platform, ", ".join(sorted(ADAPTERS))),
+                      file=sys.stderr)
+                return 2
+            root = args.plat_root or os.getcwd()
+            if not os.path.isdir(root):
+                print("error: root is not a directory: %s" % root,
+                      file=sys.stderr)
+                return 2
+            tmp_collect = tempfile.mkdtemp(prefix="memport-collect-")
+            count = collect_tree(from_platform, root, tmp_collect)
+            if count == 0:
+                print("error: no %s memory files found under %s"
+                      % (from_platform, root), file=sys.stderr)
+                return 2
+            write_source_record(tmp_collect, from_platform, root, count)
+            source = tmp_collect
+            platform_info = (from_platform, os.path.abspath(root))
+        if not os.path.isdir(source):
+            print("error: source is not a directory: %s" % source,
+                  file=sys.stderr)
+            return 2
+        entries = apply_excludes(iter_files(source), args.exclude)
+        if not entries:
+            print("error: nothing to export (no files after excludes)",
+                  file=sys.stderr)
+            return 2
+        return export_tree(args, source, entries, platform_info)
+    finally:
+        if tmp_collect and os.path.isdir(tmp_collect):
+            shutil.rmtree(tmp_collect)
+
+
+def export_tree(args, source, entries, platform_info):
+    """Pack the tree at source into args.out. entries is the
+    [(rel, full)] file list; platform_info is (platform, root) or
+    (None, None)."""
     name = args.name or os.path.basename(args.out.rstrip("/"))
     if name.endswith(".memport"):
         name = name[:-len(".memport")]
@@ -167,7 +358,9 @@ def cmd_export(args):
         payloads[rel] = data
         file_records.append((rel, sha256_bytes(data), len(data)))
 
-    manifest = build_manifest(name, source, file_records)
+    platform, platform_root = platform_info
+    manifest = build_manifest(name, source, file_records,
+                              platform=platform, platform_root=platform_root)
     tmp_out = args.out + ".tmp"
     try:
         with tarfile.open(tmp_out, "w:gz") as tar:
@@ -391,9 +584,10 @@ def cmd_inspect(args):
         print("error: %s" % e, file=sys.stderr)
         return 2
     print("memport archive: %s" % args.file)
-    for key in ("name", "created", "source", "exporter", "file-count"):
+    for key in ("name", "created", "source", "source-platform",
+                "source-root", "exporter", "file-count"):
         if key in header:
-            print("  %-11s %s" % (key + ":", header[key]))
+            print("  %-15s %s" % (key + ":", header[key]))
     print("  files:")
     total = 0
     for rel, _digest, size in entries:
@@ -462,7 +656,14 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="command", required=True)
 
     ex = sub.add_parser("export", help="export a memory directory to .memport")
-    ex.add_argument("--source", required=True, help="memory directory to export")
+    ex.add_argument("--source", default=None,
+                    help="memory directory to export (or use --from)")
+    ex.add_argument("--from", dest="from_platform", default=None,
+                    choices=sorted(ADAPTERS), metavar="PLATFORM",
+                    help="collect from a platform's native layout, then export "
+                         "(choices: %s)" % ", ".join(sorted(ADAPTERS)))
+    ex.add_argument("--root", dest="plat_root", default=None,
+                    help="platform root for --from (default: current directory)")
     ex.add_argument("--out", required=True, help="output .memport file")
     ex.add_argument("--name", default=None, help="archive name (default: out basename)")
     ex.add_argument("--exclude", action="append", default=[],
@@ -470,6 +671,19 @@ def main(argv=None):
     ex.add_argument("--redact", action="append", default=[],
                     help="regex: redact whole lines matching it (repeatable)")
     ex.set_defaults(func=cmd_export)
+
+    co = sub.add_parser("collect",
+                        help="collect a platform's native memory files into a tree")
+    co.add_argument("--platform", required=True, choices=sorted(ADAPTERS),
+                    metavar="PLATFORM",
+                    help="platform layout to collect (choices: %s)"
+                         % ", ".join(sorted(ADAPTERS)))
+    co.add_argument("--root", required=True,
+                    help="platform root: a project root, or the platform's "
+                         "home dir (e.g. ~/.claude) for user-scoped files")
+    co.add_argument("--out", required=True,
+                    help="output directory (must be new or empty)")
+    co.set_defaults(func=cmd_collect)
 
     ins = sub.add_parser("inspect", help="show archive contents")
     ins.add_argument("file", help=".memport file")
