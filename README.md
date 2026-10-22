@@ -34,6 +34,10 @@ python3 memport.py diff backup-2026-10-20.memport backup-2026-10-21.memport
 # Merge two agents' exports into one tree (conflicts resolved by strategy)
 python3 memport.py merge base.memport other.memport --into ./merged \
     --strategy keep-base   # or keep-other | both | report (dry run)
+
+# Forget files from an archive — audited, checksummed, never silent
+python3 memport.py forget backup-2026-10-21.memport --path 'memory/2026-09-*.md' \
+    --reason 'stale' --output pruned.memport   # or --in-place, or --dry-run
 ```
 
 ## Platform adapters (`collect`, `export --from`)
@@ -81,13 +85,24 @@ line to see exactly what was looked for.
   is a dry run that writes nothing (`0` = no conflicts, `10` = conflicts
   found). `merge` always checksums both archives first, and `--into` must
   be new or empty.
+- `forget --path GLOB` (repeatable): remove matching files from an
+  archive, with `--reason TEXT` recorded. Globs match like
+  `export --exclude`. Needs exactly one of `--output OUT` or `--in-place`
+  (atomic rewrite); `--dry-run` lists matches and writes nothing (and
+  takes no output args). Every operation is appended to `FORGETLOG.txt`
+  inside the archive (timestamp, removed paths, reason, sha256 of the
+  input archive beforehand), the manifest gains a `forget-operations`
+  count, and top-level `SOURCE.txt` provenance is never removed.
 
 Exit codes: `0` ok, `1` verification/overwrite failure, `2` usage error.
 `diff` follows the quietwatch convention instead: `0` identical,
 `10` differences found, `1` verification failure, `2` usage error —
 so it composes with watch/alert pipelines. `merge` uses `0` for a
 completed merge (conflicts resolved per strategy), `10` for conflicts
-found under `report`, `1`/`2` as usual.
+found under `report`, `1`/`2` as usual. `forget` uses `0` for success
+(including "nothing matched", which writes nothing), `1` for
+verification failure or a refused operation (tampered archive, would
+empty the archive), `2` for usage/read errors.
 
 ## Format
 
@@ -99,6 +114,11 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 - Path traversal (`..`, absolute paths) is rejected at parse time.
 - Symlinks are never exported.
 - Redaction is one-way and blunt — audit with `inspect` before sharing.
+- `forget` verifies the archive before mutating it, refuses tampered
+  input, never removes the top-level `SOURCE.txt` provenance record,
+  refuses to empty the archive, and records every operation in
+  `FORGETLOG.txt` (verify the chain with `inspect`). Forgetting is
+  lossy — keep the original archive if you might want the files back.
 
 ## Limitations
 
@@ -123,7 +143,7 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 ## Tests
 
 ```bash
-python3 test_memport.py   # 29 tests: roundtrips, tamper, redact, excludes, safety, diff, merge
+python3 test_memport.py   # 56 tests: roundtrips, tamper, redact, excludes, safety, diff, merge, forget
 ```
 
 ## Pre-publish checklist

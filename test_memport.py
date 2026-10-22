@@ -125,7 +125,7 @@ class TestMemport(unittest.TestCase):
 
     def test_exclude(self):
         self.do_export(exclude=["*.bin", "memory/people/*"])
-        header, entries, _blobs = memport.read_archive(self.arc)
+        header, entries, _blobs, _fl = memport.read_archive(self.arc)
         rels = [r for r, _d, _s in entries]
         self.assertNotIn("notes.bin", rels)
         self.assertNotIn("memory/people/friend.md", rels)
@@ -146,7 +146,7 @@ class TestMemport(unittest.TestCase):
         os.symlink(os.path.join(self.src, "MEMORY.md"),
                    os.path.join(self.src, "link.md"))
         self.do_export()
-        _header, entries, _blobs = memport.read_archive(self.arc)
+        _header, entries, _blobs, _fl = memport.read_archive(self.arc)
         rels = [r for r, _d, _s in entries]
         self.assertNotIn("link.md", rels)
 
@@ -345,7 +345,7 @@ class TestMerge(unittest.TestCase):
         # original manifest -> manifest checksum no longer matches payload
         import io
         import tarfile
-        header, entries, blobs = memport.read_archive(self.base)
+        header, entries, blobs, _fl = memport.read_archive(self.base)
         with open(self.base, "rb") as f:
             raw_manifest = tarfile.open("r:gz", fileobj=io.BytesIO(f.read())
                                         ).extractfile("MANIFEST.txt").read()
@@ -512,7 +512,7 @@ class TestCollect(unittest.TestCase):
         a = Args(source=None, from_platform="claude-code", plat_root=self.root,
                  out=arc, name=None, exclude=[], redact=[])
         self.assertEqual(memport.cmd_export(a), 0)
-        header, entries, blobs = memport.read_archive(arc)
+        header, entries, blobs, _fl = memport.read_archive(arc)
         self.assertEqual(header.get("source-platform"), "claude-code")
         self.assertEqual(header.get("source-root"),
                          os.path.abspath(self.root))
@@ -546,6 +546,174 @@ class TestCollect(unittest.TestCase):
         a = Args(source=None, from_platform=None, plat_root=None,
                  out=arc, name=None, exclude=[], redact=[])
         self.assertEqual(memport.cmd_export(a), 2)
+
+
+class TestForget(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        os.makedirs(self.src)
+        make_tree(self.src, SAMPLE)
+        self.arc = os.path.join(self.tmp.name, "snap.memport")
+        a = Args(source=self.src, out=self.arc, name="snap",
+                 exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def do_forget(self, arc=None, out=None, in_place=False, **kw):
+        a = Args(file=arc or self.arc, path=kw.get("path", []),
+                 reason=kw.get("reason"), output=out,
+                 in_place=in_place, dry_run=kw.get("dry_run", False))
+        return memport.cmd_forget(a)
+
+    def read(self, arc):
+        return memport.read_archive(arc)
+
+    def test_forget_removes_matched(self):
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["memory/*"],
+                                        reason="stale notes"), 0)
+        header, entries, blobs, forgetlog = self.read(new)
+        rels = [rel for rel, _d, _s in entries]
+        self.assertNotIn("memory/2026-10-21.md", rels)
+        self.assertNotIn("memory/people/friend.md", rels)
+        self.assertIn("MEMORY.md", rels)
+        self.assertIn("notes.bin", rels)
+        self.assertEqual(header.get("file-count"), "2")
+        self.assertEqual(header.get("forget-operations"), "1")
+        # Kept payloads still verify.
+        self.assertEqual(memport.verify_blobs(entries, blobs), [])
+        # Audit log records the operation.
+        self.assertTrue(forgetlog.startswith(memport.FORGET_MAGIC))
+        self.assertIn("reason: stale notes", forgetlog)
+        self.assertIn("memory/2026-10-21.md", forgetlog)
+        self.assertIn("memory/people/friend.md", forgetlog)
+        self.assertIn("archive-sha256-before: ", forgetlog)
+        # Pruned archive imports cleanly.
+        dst = os.path.join(self.tmp.name, "dst")
+        a = Args(file=new, target=dst, layout="preserve")
+        self.assertEqual(memport.cmd_import(a), 0)
+        self.assertEqual(set(read_tree(dst)),
+                         {"MEMORY.md", "notes.bin"})
+
+    def test_forget_chain_appends_and_links(self):
+        arc1 = os.path.join(self.tmp.name, "f1.memport")
+        self.assertEqual(self.do_forget(out=arc1, path=["memory/*"]), 0)
+        arc2 = os.path.join(self.tmp.name, "f2.memport")
+        self.assertEqual(self.do_forget(arc=arc1, out=arc2,
+                                        path=["notes.bin"]), 0)
+        header, entries, _blobs, forgetlog = self.read(arc2)
+        self.assertEqual(header.get("forget-operations"), "2")
+        self.assertEqual([r for r, _d, _s in entries], ["MEMORY.md"])
+        ops = [line for line in forgetlog.splitlines()
+               if line.strip() == "---"]
+        self.assertEqual(len(ops), 2)
+        self.assertTrue(forgetlog.startswith(memport.FORGET_MAGIC))
+        with open(arc1, "rb") as f:
+            arc1_sha = memport.sha256_bytes(f.read())
+        # The second operation's block links back to the first archive file.
+        second_block = forgetlog.split("---\n")[-1]
+        self.assertIn("archive-sha256-before: %s" % arc1_sha, second_block)
+
+    def test_forget_no_match_is_noop(self):
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["nope*"]), 0)
+        self.assertFalse(os.path.exists(new))
+        _h, entries, _b, _f = self.read(self.arc)
+        self.assertEqual(len(entries), 4)  # original untouched
+
+    def test_forget_dry_run_writes_nothing(self):
+        # --dry-run needs no --output and writes nothing.
+        a = Args(file=self.arc, path=["memory/*"], reason=None,
+                 output=None, in_place=False, dry_run=True)
+        self.assertEqual(memport.cmd_forget(a), 0)
+        _h, entries, _b, _f = self.read(self.arc)
+        self.assertEqual(len(entries), 4)
+
+    def test_forget_refuses_tampered_archive(self):
+        with tarfile.open(self.arc, "r:gz") as tar:
+            members = [(m, tar.extractfile(m).read() if m.isfile() else None)
+                       for m in tar.getmembers()]
+        with tarfile.open(self.arc, "w:gz") as tar:
+            for m, data in members:
+                if data is None:
+                    tar.addfile(m)
+                    continue
+                if m.name.endswith("MEMORY.md"):
+                    data = b"tampered\n"
+                m.size = len(data)
+                import io
+                tar.addfile(m, io.BytesIO(data))
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["memory/*"]), 1)
+        self.assertFalse(os.path.exists(new))
+
+    def test_forget_refuses_to_empty_archive(self):
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["*"]), 1)
+        self.assertFalse(os.path.exists(new))
+
+    def test_forget_protects_source_txt(self):
+        make_tree(self.src, {"SOURCE.txt": "provenance\n"})
+        a = Args(source=self.src, out=self.arc, name="snap",
+                 exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 0)
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["*"]), 0)
+        _h, entries, blobs, _f = self.read(new)
+        self.assertEqual([r for r, _d, _s in entries], ["SOURCE.txt"])
+        self.assertEqual(blobs["SOURCE.txt"], b"provenance\n")
+        self.assertEqual(memport.verify_blobs(entries, blobs), [])
+
+    def test_forget_in_place(self):
+        self.assertEqual(self.do_forget(in_place=True,
+                                        path=["notes.bin"]), 0)
+        _h, entries, blobs, _f = self.read(self.arc)
+        rels = [r for r, _d, _s in entries]
+        self.assertNotIn("notes.bin", rels)
+        self.assertEqual(len(rels), 3)
+        self.assertEqual(memport.verify_blobs(entries, blobs), [])
+
+    def test_forget_needs_exactly_one_output(self):
+        a = Args(file=self.arc, path=["x"], reason=None,
+                 output=None, in_place=False, dry_run=False)
+        self.assertEqual(memport.cmd_forget(a), 2)
+        a = Args(file=self.arc, path=["x"], reason=None,
+                 output="/tmp/x.memport", in_place=True, dry_run=False)
+        self.assertEqual(memport.cmd_forget(a), 2)
+        # --dry-run is exempt from the output requirement, but combining
+        # it with an output destination is contradictory.
+        a = Args(file=self.arc, path=["x"], reason=None,
+                 output=None, in_place=False, dry_run=True)
+        self.assertEqual(memport.cmd_forget(a), 0)
+        a = Args(file=self.arc, path=["x"], reason=None,
+                 output="/tmp/x.memport", in_place=False, dry_run=True)
+        self.assertEqual(memport.cmd_forget(a), 2)
+
+    def test_forget_usage_errors(self):
+        # no --path
+        self.assertEqual(self.do_forget(out="/tmp/x.memport"), 2)
+        # unreadable archive
+        a = Args(file=os.path.join(self.tmp.name, "nope.memport"),
+                 path=["x"], reason=None, output="/tmp/x.memport",
+                 in_place=False, dry_run=False)
+        self.assertEqual(memport.cmd_forget(a), 2)
+
+    def test_inspect_reports_forget_log(self):
+        new = os.path.join(self.tmp.name, "pruned.memport")
+        self.assertEqual(self.do_forget(out=new, path=["notes.bin"]), 0)
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        a = Args(file=new, verify=True)
+        with redirect_stdout(buf):
+            self.assertEqual(memport.cmd_inspect(a), 0)
+        out = buf.getvalue()
+        self.assertIn("forget-operations: 1", out)
+        self.assertIn("forget-log:", out)
+        self.assertIn("verify: OK", out)
 
 
 if __name__ == "__main__":

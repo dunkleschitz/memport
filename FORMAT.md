@@ -5,6 +5,7 @@ A `.memport` file is a **gzip-compressed tar archive** with a fixed layout:
 ```
 <name>.memport
 ├── MANIFEST.txt        # plain-text manifest (UTF-8), see below
+├── FORGETLOG.txt       # present only if forget was used: audit trail of removals
 └── files/              # one member per exported file, relative paths preserved
     ├── MEMORY.md
     └── memory/
@@ -34,7 +35,9 @@ offset), `source` (absolute path the tree was exported from), `exporter`
 (tool name + version), `file-count`. When the export came from
 `export --from PLATFORM`, two more keys are present: `source-platform`
 (the adapter name) and `source-root` (the platform root the files were
-collected from). Readers MUST ignore unknown header keys (forward
+collected from). After any `forget` operation the key
+`forget-operations` holds the running count of forget operations applied
+to the archive. Readers MUST ignore unknown header keys (forward
 compatibility).
 
 Each file entry is: two spaces, the relative POSIX path (no leading `/`,
@@ -56,6 +59,42 @@ from the archive.
 5. Never overwrite an existing file on import; fail instead.
 6. Treat redaction as lossy: `inspect` reports `exporter` but cannot tell
    you what was redacted.
+7. A writer implementing `forget` MUST verify all payload checksums
+   before removing anything, MUST refuse to produce an archive with zero
+   `files/` entries, and MUST NOT remove the top-level `SOURCE.txt`
+   provenance member.
+
+## FORGETLOG.txt (written by `forget`)
+
+Present only in archives that have had at least one forget operation.
+UTF-8 plain text. First line is the magic `memport-forget/1`, then one
+block per operation, separated by a line containing exactly `---`:
+
+```
+memport-forget/1
+---
+at: 2026-10-22T17:32:30-0400
+tool: memport 0.5.0
+archive-sha256-before: fd0533b5…
+removed: 1
+reason: stale
+files:
+  memory/2026-09-01.md
+```
+
+Each block records when the operation ran, which tool ran it, the sha256
+of the input archive *file* before the operation (so anyone who kept the
+previous archive file can verify the chain), how many files were
+removed, the operator-supplied reason (`-` when none was given), and the
+removed paths. Blocks are append-only: a forget never rewrites history,
+only appends.
+
+`FORGETLOG.txt` is archive metadata, like `MANIFEST.txt` — it is not
+listed in the manifest's `files:` section and its checksum is not
+tracked there. The log is an audit trail, not a cryptographic proof:
+intermediate manifests are not retained, so the chain is verifiable only
+by holders of the previous archive files. `inspect` reports the number
+of logged operations.
 
 ## Design notes
 

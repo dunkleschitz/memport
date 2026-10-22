@@ -1,5 +1,21 @@
 ## Unreleased
 
+- **v0.5.0: `forget` subcommand.** Remove files from an archive by
+  archive-relative glob (`--path`, repeatable, same matching as
+  `export --exclude`), with `--reason` recorded: `forget ARCHIVE --path
+  GLOB [--reason TEXT] (--output OUT | --in-place) [--dry-run]`.
+  The archive is integrity-verified before anything is removed (tampered
+  input exits 1); removed entries drop out of the manifest (which gains a
+  `forget-operations` count); every operation is appended to an in-archive
+  `FORGETLOG.txt` audit trail (timestamp, removed paths, reason, sha256
+  of the input archive beforehand — verifiable by anyone who kept the
+  previous file); top-level `SOURCE.txt` provenance is never removed;
+  refusing to empty the archive. `--dry-run` lists matches and writes
+  nothing. `inspect` now reports forget-operations and the forget log.
+  FORMAT.md documents `FORGETLOG.txt`, the new manifest key, and the
+  normative forget rules. 11 new tests; suite now 56/56. One UX fix found
+  by CLI smoke test: `--dry-run` no longer requires `--output`/`--in-place`
+  (contradictory to combine them — exits 2).
 - Added `--version` flag (bench-wide CLI convention: `<tool> <VERSION>`; module-level `VERSION` constant as single source of truth).
 - **v0.4.0: platform adapters.** New `collect --platform P --root DIR --out DIR`
   subcommand and `export --from P --root DIR` sugar: normalize the native

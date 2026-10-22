@@ -19,6 +19,8 @@ Usage:
     memport.py diff   OLD.memport NEW.memport [--verify]
     memport.py merge  BASE.mport OTHER.mport --into DIR
                       [--strategy keep-base|keep-other|both|report]
+    memport.py forget ARCHIVE.memport --path GLOB [--path ...]
+                      [--reason TEXT] (--output OUT | --in-place) [--dry-run]
 
 Platforms for collect / export --from: claude-code, cursor, opencode,
 codex, gemini, generic. --root is the platform's root directory: a
@@ -39,10 +41,16 @@ import tempfile
 import time
 
 MAGIC = "MEMPORT/1"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MANIFEST_NAME = "MANIFEST.txt"
+FORGETLOG_NAME = "FORGETLOG.txt"
+FORGET_MAGIC = "memport-forget/1"
 FILES_PREFIX = "files/"
 REDACT_TOKEN = "[REDACTED]"
+
+# Top-level archive members that are provenance/metadata, never memory
+# content: forget refuses to remove them (they are skipped with a note).
+PROTECTED_MEMBERS = {"SOURCE.txt"}
 
 # Platform-native memory layouts, verified against each platform's
 # documented file locations (Oct 2026). Globs are matched root-relative
@@ -386,8 +394,9 @@ def export_tree(args, source, entries, platform_info):
 
 
 def read_archive(path):
-    """Open .memport, return (manifest_text, {rel: bytes}). Verifies
-    tar structure only; checksums verified by caller when requested."""
+    """Open .memport, return (header dict, entries, {rel: bytes},
+    forget-log text or None). Verifies tar structure only; checksums
+    verified by caller when requested."""
     if not tarfile.is_tarfile(path):
         raise ValueError("not a readable archive: %s" % path)
     with tarfile.open(path, "r:gz") as tar:
@@ -404,7 +413,10 @@ def read_archive(path):
             if f is None:
                 raise ValueError("archive missing payload: %s" % arcname)
             blobs[rel] = f.read()
-    return header, entries, blobs
+        forgetlog = None
+        if FORGETLOG_NAME in names:
+            forgetlog = tar.extractfile(FORGETLOG_NAME).read().decode("utf-8")
+    return header, entries, blobs, forgetlog
 
 
 def verify_blobs(entries, blobs):
@@ -431,7 +443,7 @@ def cmd_diff(args):
     archives = []
     for path in (args.old, args.new):
         try:
-            header, entries, blobs = read_archive(path)
+            header, entries, blobs, _forgetlog = read_archive(path)
         except (ValueError, tarfile.TarError, OSError, EOFError) as e:
             print("error: %s: %s" % (path, e), file=sys.stderr)
             return 2
@@ -488,7 +500,7 @@ def cmd_merge(args):
     archives = []
     for path in (args.base, args.other):
         try:
-            header, entries, blobs = read_archive(path)
+            header, entries, blobs, _forgetlog = read_archive(path)
         except (ValueError, tarfile.TarError, OSError, EOFError) as e:
             print("error: %s: %s" % (path, e), file=sys.stderr)
             return 2
@@ -577,17 +589,178 @@ def cmd_merge(args):
     return 0
 
 
+def build_forget_manifest(header, kept, total_forgets):
+    """Rebuild MANIFEST.txt after a forget: keep the original header key
+    order, refresh file-count, record the running forget-operations
+    count, and list only the kept entries."""
+    lines = [MAGIC]
+    for key, val in header.items():
+        if key in ("file-count", "forget-operations"):
+            continue  # rewritten below
+        lines.append("%s: %s" % (key, val))
+    lines.append("file-count: %d" % len(kept))
+    lines.append("forget-operations: %d" % total_forgets)
+    lines.append("files:")
+    for rel, digest, size in kept:
+        lines.append("  %s sha256:%s size:%d" % (rel, digest, size))
+    return "\n".join(lines) + "\n"
+
+
+def append_forget_log(existing, archive_sha_before, removed_rels, reason):
+    """Append one operation block to FORGETLOG.txt. Each block records the
+    sha256 of the input archive file *before* the operation, so anyone who
+    kept the previous archive file can verify the chain. This is an audit
+    trail, not a cryptographic proof — intermediate manifests are not
+    retained."""
+    block = [
+        "---",
+        "at: %s" % utc_iso_now(),
+        "tool: memport %s" % VERSION,
+        "archive-sha256-before: %s" % archive_sha_before,
+        "removed: %d" % len(removed_rels),
+        "reason: %s" % (reason if reason else "-"),
+        "files:",
+    ]
+    block.extend("  %s" % rel for rel in sorted(removed_rels))
+    if existing:
+        return existing.rstrip("\n") + "\n" + "\n".join(block) + "\n"
+    return FORGET_MAGIC + "\n" + "\n".join(block) + "\n"
+
+
+def write_archive_file(out_path, manifest_text, forgetlog_text, kept, blobs):
+    """Write a fresh .memport atomically (tmp + rename)."""
+    tmp_out = out_path + ".tmp"
+    try:
+        with tarfile.open(tmp_out, "w:gz") as tar:
+            for arcname, text in ((MANIFEST_NAME, manifest_text),
+                                  (FORGETLOG_NAME, forgetlog_text)):
+                mbytes = text.encode("utf-8")
+                ti = tarfile.TarInfo(arcname)
+                ti.size = len(mbytes)
+                ti.mtime = int(time.time())
+                ti.mode = 0o644
+                tar.addfile(ti, io.BytesIO(mbytes))
+            for rel, _digest, _size in kept:
+                data = blobs[rel]
+                ti = tarfile.TarInfo(FILES_PREFIX + rel)
+                ti.size = len(data)
+                ti.mtime = int(time.time())
+                ti.mode = 0o644
+                tar.addfile(ti, io.BytesIO(data))
+        os.replace(tmp_out, out_path)
+    finally:
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+
+
+def cmd_forget(args):
+    """Remove files matching --path globs from a .memport archive.
+
+    The archive is integrity-verified first; forget never mutates
+    unverified data. Removed entries drop out of the manifest, the
+    manifest gains a forget-operations count, and every operation is
+    appended to FORGETLOG.txt (who/what/when + the sha256 of the input
+    archive beforehand). Protected provenance members (top-level
+    SOURCE.txt) are never removed. Refuses to empty the archive.
+
+    Exit codes: 0 ok (including "nothing matched"), 1 verification
+    failure or operation refused, 2 usage/read error."""
+    if args.dry_run and (args.output or args.in_place):
+        print("error: --dry-run writes nothing; drop --output/--in-place",
+              file=sys.stderr)
+        return 2
+    if not args.dry_run and bool(args.output) == bool(args.in_place):
+        print("error: need exactly one of --output OUT or --in-place",
+              file=sys.stderr)
+        return 2
+    if not args.path:
+        print("error: need at least one --path GLOB", file=sys.stderr)
+        return 2
+    try:
+        header, entries, blobs, forgetlog = read_archive(args.file)
+    except (ValueError, tarfile.TarError, OSError, EOFError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 2
+    problems = verify_blobs(entries, blobs)
+    if problems:
+        print("error: archive failed integrity check:", file=sys.stderr)
+        for p in problems:
+            print("  - %s" % p, file=sys.stderr)
+        return 1
+
+    matched = []
+    protected_skipped = 0
+    for rel, digest, size in entries:
+        hits = any(fnmatch.fnmatch(rel, p)
+                   or fnmatch.fnmatch(os.path.basename(rel), p)
+                   for p in args.path)
+        if not hits:
+            continue
+        if rel in PROTECTED_MEMBERS:
+            protected_skipped += 1
+            continue
+        matched.append((rel, digest, size))
+
+    if args.dry_run:
+        for rel, _digest, _size in matched:
+            print("WOULD-REMOVE %s" % rel)
+        print("dry run: %d file(s) would be removed%s; archive unchanged"
+              % (len(matched),
+                 " (%d protected skipped)" % protected_skipped
+                 if protected_skipped else ""))
+        return 0
+
+    if not matched:
+        msg = "0 file(s) matched; archive unchanged"
+        if protected_skipped:
+            msg += " (%d protected provenance file(s) skipped)" % protected_skipped
+        print(msg)
+        return 0
+
+    matched_rels = {rel for rel, _d, _s in matched}
+    kept = [e for e in entries if e[0] not in matched_rels]
+    if not kept:
+        print("error: forget would empty the archive (all %d file(s) "
+              "matched); refusing" % len(entries), file=sys.stderr)
+        return 1
+
+    with open(args.file, "rb") as f:
+        archive_sha_before = sha256_bytes(f.read())
+    try:
+        total_forgets = int(header.get("forget-operations", "0")) + 1
+    except ValueError:
+        total_forgets = 1
+    manifest_text = build_forget_manifest(header, kept, total_forgets)
+    forgetlog_text = append_forget_log(
+        forgetlog, archive_sha_before, matched_rels, args.reason)
+
+    out = args.output if args.output else args.file
+    write_archive_file(out, manifest_text, forgetlog_text, kept, blobs)
+    print("forgot %d file(s)%s -> %s"
+          % (len(matched),
+             " (%d protected skipped)" % protected_skipped
+             if protected_skipped else "",
+             out))
+    return 0
+
+
 def cmd_inspect(args):
     try:
-        header, entries, blobs = read_archive(args.file)
+        header, entries, blobs, forgetlog = read_archive(args.file)
     except (ValueError, tarfile.TarError, OSError, EOFError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
     print("memport archive: %s" % args.file)
     for key in ("name", "created", "source", "source-platform",
-                "source-root", "exporter", "file-count"):
+                "source-root", "exporter", "file-count",
+                "forget-operations"):
         if key in header:
             print("  %-15s %s" % (key + ":", header[key]))
+    if forgetlog:
+        ops = sum(1 for line in forgetlog.splitlines()
+                  if line.strip() == "---")
+        print("  forget-log:     %d operation(s) in %s"
+              % (ops, FORGETLOG_NAME))
     print("  files:")
     total = 0
     for rel, _digest, size in entries:
@@ -614,7 +787,7 @@ def safe_join(base, rel):
 
 def cmd_import(args):
     try:
-        header, entries, blobs = read_archive(args.file)
+        header, entries, blobs, _forgetlog = read_archive(args.file)
     except (ValueError, tarfile.TarError, OSError, EOFError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
@@ -713,6 +886,22 @@ def main(argv=None):
                     default="keep-base",
                     help="conflict resolution (default: keep-base)")
     mg.set_defaults(func=cmd_merge)
+
+    fg = sub.add_parser("forget",
+                        help="remove files from a .memport archive (audited)")
+    fg.add_argument("file", help=".memport file to forget from")
+    fg.add_argument("--path", action="append", default=[], metavar="GLOB",
+                    help="archive-relative glob to remove (repeatable; "
+                         "matches like export --exclude)")
+    fg.add_argument("--reason", default=None,
+                    help="reason recorded in FORGETLOG.txt")
+    fg.add_argument("--output", default=None,
+                    help="write the pruned archive here")
+    fg.add_argument("--in-place", action="store_true",
+                    help="rewrite the input archive (atomic)")
+    fg.add_argument("--dry-run", action="store_true",
+                    help="list what would be removed, write nothing")
+    fg.set_defaults(func=cmd_forget)
 
     args = ap.parse_args(argv)
     return args.func(args)
