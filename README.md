@@ -43,6 +43,20 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 - Symlinks are never exported.
 - Redaction is one-way and blunt — audit with `inspect` before sharing.
 
+## Limitations
+
+- **Format is memport-native.** The receiving side needs memport (or an
+  independent reader of the documented FORMAT.md) to unpack; there is no
+  importer for any platform's proprietary memory store.
+- **Redaction is blunt.** `--redact` matches whole lines against a regex;
+  it is not a semantic scrubber, and non-UTF-8 files are never redacted
+  (they pass through untouched). Always `inspect` before sharing.
+- **No merging.** Import refuses to overwrite; reconciling two divergent
+  memory trees is manual work.
+- **Integrity, not provenance.** A tampered archive is detected, but an
+  honestly exported archive of junk memory is still junk — checksums
+  can't tell you the source was worth keeping.
+
 ## Tests
 
 ```bash

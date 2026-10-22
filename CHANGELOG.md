@@ -23,3 +23,8 @@ agent-memory export/import.
   the standalone secrets scanner was rejected as a saturated space, so the
   secrets-scan gate lives in each project's README — gitleaks/trufflehog
   before any public release).
+
+## v1.0.1 — 2026-10-22
+
+- README gains a Limitations section (memport-native format, blunt
+  redaction, no merge on import, integrity-vs-provenance).
