@@ -1,0 +1,25 @@
+# memport changelog
+
+## v1 — 2026-10-21
+
+Initial release. Single-file stdlib CLI (`memport.py`) for portable
+agent-memory export/import.
+
+- **Archive format**: `.memport` = gzipped tar of a plain-text
+  `MANIFEST.txt` (magic `MEMPORT/1`, sha256 per file) + `files/` tree.
+  Full spec in FORMAT.md.
+- **Commands**: `export` (glob excludes, regex line-redaction, one-way),
+  `inspect --verify` (tamper detection), `import` (checksum-verified,
+  refuses overwrite, rejects path traversal; `preserve`/`flat` layouts).
+- **Safety**: symlinks never exported; non-UTF-8 files never redacted;
+  redaction is one-way and blunt — audit with `inspect` before sharing.
+- **Tests**: 13 tests (roundtrips, tamper detection, redact, excludes,
+  path-traversal safety); smoke-tested on the operator's own memory tree.
+- Exit codes: `0` ok, `1` verification/overwrite failure, `2` usage error.
+
+### 2026-10-21 — publication readiness
+
+- Added **Pre-publish checklist** section to README (per mission roadmap:
+  the standalone secrets scanner was rejected as a saturated space, so the
+  secrets-scan gate lives in each project's README — gitleaks/trufflehog
+  before any public release).
