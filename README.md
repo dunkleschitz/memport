@@ -19,6 +19,9 @@ python3 memport.py inspect backup-2026-10-21.memport --verify
 
 # Import it elsewhere (refuses to overwrite, refuses tampered archives)
 python3 memport.py import backup-2026-10-21.memport --target ./restored
+
+# Diff two snapshots — what changed in memory since the last export?
+python3 memport.py diff backup-2026-10-20.memport backup-2026-10-21.memport
 ```
 
 ## Options
@@ -31,6 +34,9 @@ python3 memport.py import backup-2026-10-21.memport --target ./restored
   recreating the tree (handy for platforms that want one flat folder).
 
 Exit codes: `0` ok, `1` verification/overwrite failure, `2` usage error.
+`diff` follows the quietwatch convention instead: `0` identical,
+`10` differences found, `1` verification failure, `2` usage error —
+so it composes with watch/alert pipelines.
 
 ## Format
 
@@ -60,7 +66,7 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 ## Tests
 
 ```bash
-python3 test_memport.py   # 13 tests: roundtrips, tamper, redact, excludes, safety
+python3 test_memport.py   # 21 tests: roundtrips, tamper, redact, excludes, safety, diff
 ```
 
 ## Pre-publish checklist

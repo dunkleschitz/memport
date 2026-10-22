@@ -28,3 +28,17 @@ agent-memory export/import.
 
 - README gains a Limitations section (memport-native format, blunt
   redaction, no merge on import, integrity-vs-provenance).
+
+## v0.2.0 — 2026-10-22
+
+- New `diff OLD.memport NEW.memport` subcommand: compares two exports by
+  manifest checksums (not tar bytes, so a re-export with only timestamp
+  changes diffs clean). Prints ADDED / REMOVED / MODIFIED (with byte
+  deltas and sha prefixes) plus an unchanged-count summary.
+- Exit codes follow the quietwatch convention: `0` identical,
+  `10` differences found, `1` verification failure, `2` usage error.
+- `diff --verify` checksums both archives before comparing.
+- 8 new tests (identical re-export silence, modify/add/remove detection,
+  verify flag, unreadable/missing archive handling); suite now 21/21.
+- README quick start and exit-code docs updated; FORMAT.md unchanged
+  (no format change — `diff` consumes the v1 manifest).

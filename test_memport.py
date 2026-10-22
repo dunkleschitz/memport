@@ -175,5 +175,76 @@ class TestMemport(unittest.TestCase):
         self.assertEqual(memport.cmd_export(a), 2)
 
 
+class TestDiff(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        os.makedirs(self.src)
+        make_tree(self.src, SAMPLE)
+        self.old = os.path.join(self.tmp.name, "old.memport")
+        self.new = os.path.join(self.tmp.name, "new.memport")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def do_export(self, src, out):
+        a = Args(source=src, out=out, name="n", exclude=[], redact=[])
+        self.assertEqual(memport.cmd_export(a), 0)
+
+    def do_diff(self, **kw):
+        a = Args(old=kw.get("old", self.old), new=kw.get("new", self.new),
+                 verify=kw.get("verify", False))
+        return memport.cmd_diff(a)
+
+    def test_identical_exports_exit_zero(self):
+        self.do_export(self.src, self.old)
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(), 0)
+
+    def test_identical_exports_silent_on_reexport(self):
+        # Re-export is byte-different (timestamps) but content-identical.
+        self.do_export(self.src, self.old)
+        make_tree(self.src, {})  # no-op: touch nothing
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(), 0)
+
+    def test_modified_file(self):
+        self.do_export(self.src, self.old)
+        make_tree(self.src, {"MEMORY.md": "# memory\n- likes tacos\n- new line\n"})
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(), 10)
+
+    def test_added_and_removed(self):
+        self.do_export(self.src, self.old)
+        os.remove(os.path.join(self.src, "notes.bin"))
+        make_tree(self.src, {"extra.md": "brand new\n"})
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(), 10)
+
+    def test_empty_tree_change_still_detected(self):
+        # Same file count, one file swapped out: added+removed, not modified.
+        self.do_export(self.src, self.old)
+        os.remove(os.path.join(self.src, "notes.bin"))
+        make_tree(self.src, {"notes.bin": "not binary anymore\n"})
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(), 10)
+
+    def test_diff_with_verify_ok(self):
+        self.do_export(self.src, self.old)
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(verify=True), 0)
+
+    def test_diff_unreadable_archive_exit_two(self):
+        bogus = os.path.join(self.tmp.name, "bogus.memport")
+        with open(bogus, "w") as f:
+            f.write("not a tar file at all")
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(old=bogus), 2)
+
+    def test_diff_missing_archive_exit_two(self):
+        self.do_export(self.src, self.new)
+        self.assertEqual(self.do_diff(old=os.path.join(self.tmp.name, "nope.memport")), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

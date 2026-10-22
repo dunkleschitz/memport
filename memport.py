@@ -13,6 +13,7 @@ Usage:
                        [--exclude GLOB ...] [--redact REGEX ...]
     memport.py inspect FILE.memport [--verify]
     memport.py import  FILE.memport --target DIR [--layout preserve|flat]
+    memport.py diff   OLD.memport NEW.memport [--verify]
 """
 
 import argparse
@@ -27,7 +28,7 @@ import tarfile
 import time
 
 MAGIC = "MEMPORT/1"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MANIFEST_NAME = "MANIFEST.txt"
 FILES_PREFIX = "files/"
 REDACT_TOKEN = "[REDACTED]"
@@ -226,6 +227,52 @@ def verify_blobs(entries, blobs):
     return problems
 
 
+def cmd_diff(args):
+    """Compare two .memport archives by manifest (checksums, not tar bytes),
+    so a re-export with only timestamp or ordering changes diffs clean.
+
+    Exit codes mirror quietwatch: 0 = identical, 10 = differences found,
+    1 = an archive failed integrity verification, 2 = usage/read error."""
+    archives = []
+    for path in (args.old, args.new):
+        try:
+            header, entries, blobs = read_archive(path)
+        except (ValueError, tarfile.TarError, OSError, EOFError) as e:
+            print("error: %s: %s" % (path, e), file=sys.stderr)
+            return 2
+        archives.append((path, header, entries, blobs))
+    if args.verify:
+        for path, _header, entries, blobs in archives:
+            problems = verify_blobs(entries, blobs)
+            if problems:
+                print("error: %s failed integrity check:" % path, file=sys.stderr)
+                for p in problems:
+                    print("  - %s" % p, file=sys.stderr)
+                return 1
+    old_entries = {rel: (digest, size) for rel, digest, size in archives[0][2]}
+    new_entries = {rel: (digest, size) for rel, digest, size in archives[1][2]}
+    added = sorted(set(new_entries) - set(old_entries))
+    removed = sorted(set(old_entries) - set(new_entries))
+    modified = sorted(rel for rel in set(old_entries) & set(new_entries)
+                      if old_entries[rel] != new_entries[rel])
+    for rel in added:
+        _digest, size = new_entries[rel]
+        print("ADDED    %s (%d bytes)" % (rel, size))
+    for rel in removed:
+        _digest, size = old_entries[rel]
+        print("REMOVED  %s (was %d bytes)" % (rel, size))
+    for rel in modified:
+        old_size = old_entries[rel][1]
+        new_size = new_entries[rel][1]
+        print("MODIFIED %s (%d -> %d bytes, sha %s -> %s)"
+              % (rel, old_size, new_size,
+                 old_entries[rel][0][:12], new_entries[rel][0][:12]))
+    n_same = (len(old_entries) - len(removed) - len(modified))
+    print("summary: %d added, %d removed, %d modified, %d unchanged"
+          % (len(added), len(removed), len(modified), n_same))
+    return 10 if (added or removed or modified) else 0
+
+
 def cmd_inspect(args):
     try:
         header, entries, blobs = read_archive(args.file)
@@ -324,6 +371,13 @@ def main(argv=None):
     imp.add_argument("--layout", choices=["preserve", "flat"], default="preserve",
                      help="preserve: keep tree; flat: join dirs with __")
     imp.set_defaults(func=cmd_import)
+
+    di = sub.add_parser("diff", help="compare two .memport archives by content")
+    di.add_argument("old", help="older .memport file")
+    di.add_argument("new", help="newer .memport file")
+    di.add_argument("--verify", action="store_true",
+                    help="verify sha256 checksums before comparing")
+    di.set_defaults(func=cmd_diff)
 
     args = ap.parse_args(argv)
     return args.func(args)
