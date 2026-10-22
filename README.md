@@ -74,6 +74,9 @@ line to see exactly what was looked for.
 ## Options
 
 - `export --exclude GLOB` (repeatable): skip files, e.g. `--exclude "*.tmp"`.
+- `export --name NAME`: archive name recorded in the manifest (default:
+  the output file's basename).
+- `--version`: print the version and exit.
 - `export --redact REGEX` (repeatable): replace whole lines matching the
   regex with `[REDACTED]` before hashing — useful before sharing memory
   across platforms. Non-UTF-8 files are never touched.
