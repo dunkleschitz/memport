@@ -22,6 +22,10 @@ python3 memport.py import backup-2026-10-21.memport --target ./restored
 
 # Diff two snapshots — what changed in memory since the last export?
 python3 memport.py diff backup-2026-10-20.memport backup-2026-10-21.memport
+
+# Merge two agents' exports into one tree (conflicts resolved by strategy)
+python3 memport.py merge base.memport other.memport --into ./merged \
+    --strategy keep-base   # or keep-other | both | report (dry run)
 ```
 
 ## Options
@@ -32,11 +36,19 @@ python3 memport.py diff backup-2026-10-20.memport backup-2026-10-21.memport
   across platforms. Non-UTF-8 files are never touched.
 - `import --layout flat`: join subdirectories with `__` instead of
   recreating the tree (handy for platforms that want one flat folder).
+- `merge --strategy`: conflict handling for same-path different-content
+  files. `keep-base` (default) and `keep-other` pick a side; `both` writes
+  the base version as-is and the other version as `<path>.other`; `report`
+  is a dry run that writes nothing (`0` = no conflicts, `10` = conflicts
+  found). `merge` always checksums both archives first, and `--into` must
+  be new or empty.
 
 Exit codes: `0` ok, `1` verification/overwrite failure, `2` usage error.
 `diff` follows the quietwatch convention instead: `0` identical,
 `10` differences found, `1` verification failure, `2` usage error —
-so it composes with watch/alert pipelines.
+so it composes with watch/alert pipelines. `merge` uses `0` for a
+completed merge (conflicts resolved per strategy), `10` for conflicts
+found under `report`, `1`/`2` as usual.
 
 ## Format
 
@@ -57,8 +69,10 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 - **Redaction is blunt.** `--redact` matches whole lines against a regex;
   it is not a semantic scrubber, and non-UTF-8 files are never redacted
   (they pass through untouched). Always `inspect` before sharing.
-- **No merging.** Import refuses to overwrite; reconciling two divergent
-  memory trees is manual work.
+- **Merging is checksum-level, not semantic.** `merge` reconciles files by
+  content hash; it doesn't understand Markdown sections or memory
+  semantics. For true cross-agent memory reconciliation, review conflicts
+  with `merge --strategy report` first.
 - **Integrity, not provenance.** A tampered archive is detected, but an
   honestly exported archive of junk memory is still junk — checksums
   can't tell you the source was worth keeping.
@@ -66,7 +80,7 @@ See [FORMAT.md](FORMAT.md) for the full `.memport` archive specification.
 ## Tests
 
 ```bash
-python3 test_memport.py   # 21 tests: roundtrips, tamper, redact, excludes, safety, diff
+python3 test_memport.py   # 29 tests: roundtrips, tamper, redact, excludes, safety, diff, merge
 ```
 
 ## Pre-publish checklist

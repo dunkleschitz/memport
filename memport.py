@@ -14,6 +14,8 @@ Usage:
     memport.py inspect FILE.memport [--verify]
     memport.py import  FILE.memport --target DIR [--layout preserve|flat]
     memport.py diff   OLD.memport NEW.memport [--verify]
+    memport.py merge  BASE.mport OTHER.mport --into DIR
+                      [--strategy keep-base|keep-other|both|report]
 """
 
 import argparse
@@ -28,7 +30,7 @@ import tarfile
 import time
 
 MAGIC = "MEMPORT/1"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MANIFEST_NAME = "MANIFEST.txt"
 FILES_PREFIX = "files/"
 REDACT_TOKEN = "[REDACTED]"
@@ -273,6 +275,115 @@ def cmd_diff(args):
     return 10 if (added or removed or modified) else 0
 
 
+def cmd_merge(args):
+    """Merge two .memport archives into a fresh directory tree.
+
+    Both archives are integrity-verified first (merge always writes, so
+    unverified data is refused). Per relative path:
+      in one archive only -> copied from that archive
+      identical checksum  -> copied once
+      different checksum  -> conflict, resolved by --strategy:
+        keep-base (default) write the BASE version
+        keep-other          write the OTHER version
+        both                write base as path, other as path + ".other"
+        report              dry run: write nothing, list what would happen
+    --into must not exist or must be empty (never merge over data).
+
+    Exit codes mirror quietwatch: 0 = merged cleanly (or no conflicts
+    under report), 10 = conflicts found under report, 1 = integrity or
+    target failure, 2 = usage/read error."""
+    archives = []
+    for path in (args.base, args.other):
+        try:
+            header, entries, blobs = read_archive(path)
+        except (ValueError, tarfile.TarError, OSError, EOFError) as e:
+            print("error: %s: %s" % (path, e), file=sys.stderr)
+            return 2
+        problems = verify_blobs(entries, blobs)
+        if problems:
+            print("error: %s failed integrity check:" % path, file=sys.stderr)
+            for p in problems:
+                print("  - %s" % p, file=sys.stderr)
+            return 1
+        archives.append((path, {rel: (digest, size) for rel, digest, size
+                                in entries}, blobs))
+    _base_path, base_entries, base_blobs = archives[0]
+    _other_path, other_entries, other_blobs = archives[1]
+
+    added_base = sorted(set(base_entries) - set(other_entries))
+    added_other = sorted(set(other_entries) - set(base_entries))
+    common = sorted(set(base_entries) & set(other_entries))
+    identical = [rel for rel in common
+                 if base_entries[rel] == other_entries[rel]]
+    conflicts = [rel for rel in common
+                 if base_entries[rel] != other_entries[rel]]
+
+    strategy = args.strategy
+    if strategy == "report":
+        for rel in added_base:
+            print("BASE-ONLY  %s" % rel)
+        for rel in added_other:
+            print("OTHER-ONLY %s" % rel)
+        for rel in identical:
+            print("IDENTICAL  %s" % rel)
+        for rel in conflicts:
+            print("CONFLICT   %s (base %s / other %s)"
+                  % (rel, base_entries[rel][0][:12], other_entries[rel][0][:12]))
+        print("summary: %d base-only, %d other-only, %d identical, %d conflict(s)"
+              % (len(added_base), len(added_other), len(identical),
+                 len(conflicts)))
+        return 10 if conflicts else 0
+
+    target = args.into
+    if os.path.exists(target):
+        if not os.path.isdir(target) or os.listdir(target):
+            print("error: refusing to merge into non-empty target: %s"
+                  % target, file=sys.stderr)
+            return 1
+    else:
+        os.makedirs(target, exist_ok=True)
+
+    written = {}   # rel -> source label, guards ".other" collisions
+    def write_file(rel, data, label):
+        dest = safe_join(target, rel)
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(data)
+        written[rel] = label
+
+    for rel in added_base:
+        write_file(rel, base_blobs[rel], "base")
+        print("COPIED     %s (from base)" % rel)
+    for rel in added_other:
+        write_file(rel, other_blobs[rel], "other")
+        print("COPIED     %s (from other)" % rel)
+    for rel in identical:
+        write_file(rel, base_blobs[rel], "base")
+        print("IDENTICAL  %s" % rel)
+    for rel in conflicts:
+        if strategy == "keep-other":
+            write_file(rel, other_blobs[rel], "other")
+            print("CONFLICT   %s -> kept other" % rel)
+        elif strategy == "both":
+            write_file(rel, base_blobs[rel], "base")
+            alt = rel + ".other"
+            n = 1
+            while alt in written:
+                n += 1
+                alt = "%s.other%d" % (rel, n)
+            write_file(alt, other_blobs[rel], "other")
+            print("CONFLICT   %s -> kept base, other as %s" % (rel, alt))
+        else:  # keep-base
+            write_file(rel, base_blobs[rel], "base")
+            print("CONFLICT   %s -> kept base" % rel)
+    print("summary: %d copied, %d identical, %d conflict(s, strategy=%s) -> %s"
+          % (len(added_base) + len(added_other), len(identical),
+             len(conflicts), strategy, target))
+    return 0
+
+
 def cmd_inspect(args):
     try:
         header, entries, blobs = read_archive(args.file)
@@ -378,6 +489,15 @@ def main(argv=None):
     di.add_argument("--verify", action="store_true",
                     help="verify sha256 checksums before comparing")
     di.set_defaults(func=cmd_diff)
+
+    mg = sub.add_parser("merge", help="merge two .memport archives into a directory")
+    mg.add_argument("base", help="base .memport file")
+    mg.add_argument("other", help="other .memport file")
+    mg.add_argument("--into", required=True, help="target directory (must be new or empty)")
+    mg.add_argument("--strategy", choices=["keep-base", "keep-other", "both", "report"],
+                    default="keep-base",
+                    help="conflict resolution (default: keep-base)")
+    mg.set_defaults(func=cmd_merge)
 
     args = ap.parse_args(argv)
     return args.func(args)

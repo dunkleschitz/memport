@@ -42,3 +42,22 @@ agent-memory export/import.
   verify flag, unreadable/missing archive handling); suite now 21/21.
 - README quick start and exit-code docs updated; FORMAT.md unchanged
   (no format change — `diff` consumes the v1 manifest).
+
+## v0.3.0 — 2026-10-22
+
+- New `merge BASE.mport OTHER.mport --into DIR [--strategy keep-base|keep-other|both|report]`
+  subcommand: merges two exports into one tree. Files present in one
+  archive only are copied; identical files written once; same-path
+  different-content files are conflicts resolved by strategy —
+  `keep-base` (default), `keep-other`, `both` (base as-is, other as
+  `<path>.other`, collision-safe), `report` (dry run, writes nothing).
+- `merge` always integrity-verifies both archives first (checksum/tamper
+  failure exits 1); `--into` must be new or empty (never merges over
+  existing data); path traversal still rejected at parse time.
+- Exit codes: `0` merge completed (or no conflicts under `report`),
+  `10` conflicts found under `report`, `1` verification/target failure,
+  `2` usage/read error.
+- 8 new tests (per-strategy conflict resolution, dry-run semantics,
+  non-empty target refusal, tampered/unreadable archives); suite 29/29.
+- README quick start, options, and exit-code docs updated; FORMAT.md
+  unchanged (no format change — `merge` consumes the v1 manifest).

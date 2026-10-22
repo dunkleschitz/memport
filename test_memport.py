@@ -246,5 +246,124 @@ class TestDiff(unittest.TestCase):
         self.assertEqual(self.do_diff(old=os.path.join(self.tmp.name, "nope.memport")), 2)
 
 
+class TestMerge(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base_src = os.path.join(self.tmp.name, "base")
+        self.other_src = os.path.join(self.tmp.name, "other")
+        os.makedirs(self.base_src)
+        os.makedirs(self.other_src)
+        # shared identical file, base-only, other-only, one conflict
+        make_tree(self.base_src, {
+            "shared.md": "same content\n",
+            "base-only.md": "only in base\n",
+            "conflict.md": "base version\n",
+        })
+        make_tree(self.other_src, {
+            "shared.md": "same content\n",
+            "other-only.md": "only in other\n",
+            "conflict.md": "other version\n",
+        })
+        self.base = os.path.join(self.tmp.name, "base.memport")
+        self.other = os.path.join(self.tmp.name, "other.memport")
+        for src, out in ((self.base_src, self.base),
+                         (self.other_src, self.other)):
+            a = Args(source=src, out=out, name="n", exclude=[], redact=[])
+            self.assertEqual(memport.cmd_export(a), 0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def do_merge(self, **kw):
+        into = kw.get("into", os.path.join(self.tmp.name, "merged"))
+        a = Args(base=kw.get("base", self.base),
+                 other=kw.get("other", self.other),
+                 into=into, strategy=kw.get("strategy", "keep-base"))
+        return memport.cmd_merge(a), into
+
+    def test_merge_keep_base(self):
+        rc, into = self.do_merge()
+        self.assertEqual(rc, 0)
+        tree = read_tree(into)
+        self.assertEqual(tree["shared.md"], b"same content\n")
+        self.assertEqual(tree["base-only.md"], b"only in base\n")
+        self.assertEqual(tree["other-only.md"], b"only in other\n")
+        self.assertEqual(tree["conflict.md"], b"base version\n")
+        self.assertEqual(len(tree), 4)
+
+    def test_merge_keep_other(self):
+        rc, into = self.do_merge(strategy="keep-other")
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_tree(into)["conflict.md"], b"other version\n")
+
+    def test_merge_both(self):
+        rc, into = self.do_merge(strategy="both")
+        self.assertEqual(rc, 0)
+        tree = read_tree(into)
+        self.assertEqual(tree["conflict.md"], b"base version\n")
+        self.assertEqual(tree["conflict.md.other"], b"other version\n")
+
+    def test_merge_report_is_dry_run(self):
+        into = os.path.join(self.tmp.name, "merged")
+        rc, _ = self.do_merge(strategy="report", into=into)
+        self.assertEqual(rc, 10)
+        self.assertFalse(os.path.exists(into))
+
+    def test_merge_report_clean_exits_zero(self):
+        self.do_export_same()
+        rc, _ = self.do_merge(base=self.same1, other=self.same2,
+                              strategy="report",
+                              into=os.path.join(self.tmp.name, "m2"))
+        self.assertEqual(rc, 0)
+
+    def do_export_same(self):
+        self.same1 = os.path.join(self.tmp.name, "s1.memport")
+        self.same2 = os.path.join(self.tmp.name, "s2.memport")
+        for out in (self.same1, self.same2):
+            a = Args(source=self.base_src, out=out, name="n",
+                     exclude=[], redact=[])
+            self.assertEqual(memport.cmd_export(a), 0)
+
+    def test_merge_refuses_nonempty_target(self):
+        into = os.path.join(self.tmp.name, "merged")
+        os.makedirs(into)
+        with open(os.path.join(into, "precious.txt"), "w") as f:
+            f.write("do not touch")
+        rc, _ = self.do_merge(into=into)
+        self.assertEqual(rc, 1)
+        self.assertEqual(read_tree(into), {"precious.txt": b"do not touch"})
+
+    def test_merge_unreadable_archive_exit_two(self):
+        bogus = os.path.join(self.tmp.name, "bogus.memport")
+        with open(bogus, "w") as f:
+            f.write("not a tar file at all")
+        rc, _ = self.do_merge(base=bogus)
+        self.assertEqual(rc, 2)
+
+    def test_merge_tampered_archive_exit_one(self):
+        # rebuild the base archive with a corrupted payload but the
+        # original manifest -> manifest checksum no longer matches payload
+        import io
+        import tarfile
+        header, entries, blobs = memport.read_archive(self.base)
+        with open(self.base, "rb") as f:
+            raw_manifest = tarfile.open("r:gz", fileobj=io.BytesIO(f.read())
+                                        ).extractfile("MANIFEST.txt").read()
+        tampered = os.path.join(self.tmp.name, "tampered.memport")
+        blobs = dict(blobs)
+        blobs["conflict.md"] = b"corrupted payload\n"
+        with tarfile.open(tampered, "w:gz") as tar:
+            mi = tarfile.TarInfo("MANIFEST.txt")
+            mi.size = len(raw_manifest)
+            tar.addfile(mi, io.BytesIO(raw_manifest))
+            for rel, _digest, _size in entries:
+                ti = tarfile.TarInfo("files/" + rel)
+                ti.size = len(blobs[rel])
+                tar.addfile(ti, io.BytesIO(blobs[rel]))
+        rc, _ = self.do_merge(base=tampered,
+                              into=os.path.join(self.tmp.name, "m3"))
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
