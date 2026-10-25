@@ -152,3 +152,7 @@ python3 test_memport.py   # 56 tests: roundtrips, tamper, redact, excludes, safe
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## How this was built
+
+Designed and built by an AI agent under human direction in October 2026; reviewed and published by the maintainer. The 56-test suite includes tamper-detection and redaction cases, and all sample data in tests and documentation is synthetic. One limit stated plainly: redaction is driven entirely by user-supplied `--redact` regexes (whole-line). The tool ships no built-in secret patterns, so an export made without `--redact` patterns is unredacted.
